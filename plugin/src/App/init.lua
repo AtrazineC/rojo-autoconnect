@@ -62,6 +62,12 @@ local AUTO_CONNECT_POLL_INTERVAL = 2
 local AUTO_CONNECT_MAX_FAILED_SYNCS = 3
 local ABORTED_MESSAGE = "Aborted Rojo sync operation"
 
+-- Studio saves the panel's dock position and the toolbar's ribbon placement
+-- under this name. Upstream uses "Rojo <version>", so every update looks like a
+-- new panel (hidden) and toolbar. This is the name the custom plugin had before
+-- this fork, so existing layouts carry over. Never change it.
+local STUDIO_UI_ID = "Rojo 7.4.3"
+
 local function getAttributePort(): string?
 	local value = workspace:GetAttribute(AUTO_CONNECT_PORT_ATTRIBUTE)
 	if value == nil then
@@ -1199,8 +1205,7 @@ function App:render()
 		e(Theme.StudioProvider, nil, {
 			tooltip = e(Tooltip.Provider, nil, {
 				gui = e(StudioPluginGui, {
-					-- Stable id (not versioned) so Studio keeps the panel's dock state across builds
-					id = "Rojo",
+					id = STUDIO_UI_ID,
 					title = pluginName,
 					active = self.state.guiEnabled,
 					isEphemeral = false,
@@ -1384,9 +1389,8 @@ function App:render()
 				end,
 			}),
 
-			-- Stable name (not versioned) so Studio treats rebuilds as the same toolbar
 			toolbar = e(StudioToolbar, {
-				name = "Rojo",
+				name = STUDIO_UI_ID,
 			}, {
 				button = e(StudioToggleButton, {
 					name = "Rojo",
