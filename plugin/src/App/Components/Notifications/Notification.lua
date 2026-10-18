@@ -125,7 +125,10 @@ function Notification:render()
 		local actionsY = if self.props.actions then 37 else 0
 		local textXSpace = math.max(250, buttonsX) + 35
 		local textBounds = getTextBoundsAsync(self.props.text, theme.Font.Main, theme.TextSize.Body, textXSpace)
-		local contentX = math.max(textBounds.X, buttonsX)
+		-- A few px of slack: a label exactly as wide as the measured text can still
+		-- wrap its widest line when rendered, pushing the last line out of view
+		local textX = math.ceil(textBounds.X) + 4
+		local contentX = math.max(textX, buttonsX)
 
 		local size = self.binding:map(function(value)
 			return UDim2.fromOffset(
@@ -171,7 +174,7 @@ function Notification:render()
 						TextYAlignment = Enum.TextYAlignment.Center,
 						TextWrapped = true,
 
-						Size = UDim2.new(0, textBounds.X, 1, -actionsY),
+						Size = UDim2.new(0, textX, 1, -actionsY),
 						Position = UDim2.fromOffset(35, 0),
 
 						LayoutOrder = 1,
