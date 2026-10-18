@@ -1140,18 +1140,54 @@ function App:startSession()
 			confirmData = {
 				serverInfo = serverInfo,
 			},
-			toolbarIcon = Assets.Images.PluginButton,
+			toolbarIcon = Assets.Images.PluginButtonWarning,
 		})
 
-		self:addNotification({
+		-- Stays up until a decision is made: with auto-connect the sync starts
+		-- unattended, so a short-lived toast is easy to miss and the place
+		-- silently never syncs
+		local dismissPrompt = self:addNotification({
 			text = string.format(
-				"Please accept%sor abort the initializing sync session.",
-				Settings:get("twoWaySync") and ", reject, " or " "
+				"Project '%s' needs your approval to sync\n(%d instances would change).",
+				serverInfo.projectName or "UNKNOWN",
+				PatchSet.countInstances(patch)
 			),
-			timeout = 7,
+			timeout = 86400,
+			actions = {
+				Accept = {
+					text = "Accept",
+					style = "Solid",
+					layoutOrder = 1,
+					onClick = function()
+						self.confirmationBindable:Fire("Accept")
+					end,
+				},
+				Review = {
+					text = "Review",
+					style = "Bordered",
+					layoutOrder = 2,
+					onClick = function()
+						self:setState({
+							guiEnabled = true,
+						})
+					end,
+				},
+				Abort = {
+					text = "Abort",
+					style = "Bordered",
+					layoutOrder = 3,
+					onClick = function()
+						self.confirmationBindable:Fire("Abort")
+					end,
+				},
+			},
 		})
 
-		return self.confirmationEvent:Wait()
+		local decision = self.confirmationEvent:Wait()
+		if dismissPrompt then
+			dismissPrompt()
+		end
+		return decision
 	end)
 
 	serveSession:start()
