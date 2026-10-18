@@ -10,6 +10,7 @@ local Packages = Rojo.Packages
 local Roact = require(Packages.Roact)
 local Log = require(Packages.Log)
 local Promise = require(Packages.Promise)
+local Http = require(Packages.Http)
 
 local Assets = require(Plugin.Assets)
 local Version = require(Plugin.Version)
@@ -48,14 +49,46 @@ local AppStatus = strict("AppStatus", {
 
 local e = Roact.createElement
 
+-- Auto-connect: places with a RojoDefaultPort attribute on Workspace connect to
+-- that port by themselves after a short countdown, wait for the server if it
+-- isn't up yet, and reconnect if the connection drops. Cancelling the countdown
+-- or disconnecting manually turns it off until the next manual connect.
+local AUTO_CONNECT_PORT_ATTRIBUTE = "RojoDefaultPort"
+-- Optional: refuse to auto-connect to a server serving a different project name
+local AUTO_CONNECT_PROJECT_ATTRIBUTE = "RojoProjectName"
+local AUTO_CONNECT_COUNTDOWN = 5
+local AUTO_CONNECT_POLL_INTERVAL = 2
+-- Give up after this many attempts in a row that find the server but fail to sync
+local AUTO_CONNECT_MAX_FAILED_SYNCS = 3
+local ABORTED_MESSAGE = "Aborted Rojo sync operation"
+
+local function getAttributePort(): string?
+	local value = workspace:GetAttribute(AUTO_CONNECT_PORT_ATTRIBUTE)
+	if value == nil then
+		return nil
+	end
+
+	return string.match(tostring(value), "^%s*(%d+)%s*$")
+end
+
+-- Errors that mean "nothing is listening yet" rather than "this server will never work"
+local function isServerUnreachable(err): boolean
+	return type(err) == "table" and err.type ~= nil and err.type ~= Http.Error.Kind.HttpNotEnabled
+end
+
 local App = Roact.Component:extend("App")
 
 function App:init()
 	preloadAssets()
 
 	local priorSyncInfo = self:getPriorSyncInfo()
-	self.host, self.setHost = Roact.createBinding(priorSyncInfo.host or "")
-	self.port, self.setPort = Roact.createBinding(priorSyncInfo.port or "")
+	local attributePort = getAttributePort()
+	self.host, self.setHost = Roact.createBinding(if attributePort then "" else priorSyncInfo.host or "")
+	self.port, self.setPort = Roact.createBinding(attributePort or priorSyncInfo.port or "")
+
+	-- { host, port } to auto-connect to, or nil when auto-connect is off
+	self.autoConnectTarget = nil
+	self.autoConnectFailedSyncs = 0
 
 	self.confirmationBindable = Instance.new("BindableEvent")
 	self.confirmationEvent = self.confirmationBindable.Event
@@ -149,11 +182,29 @@ function App:init()
 			end
 		end)
 
-		self:tryAutoReconnect():andThen(function(didReconnect)
-			if not didReconnect then
-				self:checkSyncReminder()
-			end
-		end)
+		if attributePort then
+			self.autoConnectTarget = { host = Config.defaultHost, port = attributePort }
+			self:startAutoConnect(AUTO_CONNECT_COUNTDOWN)
+		else
+			self:tryAutoReconnect():andThen(function(didReconnect)
+				if not didReconnect then
+					self:checkSyncReminder()
+				end
+			end)
+		end
+
+		-- Also pick up the attribute being added after the place is open
+		self.portAttributeConnection = workspace
+			:GetAttributeChangedSignal(AUTO_CONNECT_PORT_ATTRIBUTE)
+			:Connect(function()
+				local port = getAttributePort()
+				if port == nil or self.serveSession ~= nil or self.autoConnectCancelled then
+					return
+				end
+
+				self.autoConnectTarget = { host = Config.defaultHost, port = port }
+				self:startAutoConnect(AUTO_CONNECT_COUNTDOWN)
+			end)
 	end
 
 	if self:isAutoConnectPlaytestServerAvailable() then
@@ -175,6 +226,10 @@ end
 
 function App:willUnmount()
 	self:endSession()
+	self:stopAutoConnect()
+	if self.portAttributeConnection then
+		self.portAttributeConnection:Disconnect()
+	end
 
 	self.waypointConnection:Disconnect()
 	self.confirmationBindable:Destroy()
@@ -220,6 +275,21 @@ function App:addNotification(notif: {
 	return function()
 		self:closeNotification(id)
 	end
+end
+
+function App:setNotificationText(id: number, text: string)
+	if not self.state.notifications[id] then
+		return
+	end
+
+	self:setState(function(prevState)
+		local notifications = table.clone(prevState.notifications)
+		notifications[id] = Dictionary.merge(notifications[id], { text = text })
+
+		return {
+			notifications = notifications,
+		}
+	end)
 end
 
 function App:closeNotification(id: number)
@@ -432,6 +502,181 @@ function App:tryAutoReconnect()
 		end)
 end
 
+-- Counts down, then polls until the target server answers and starts a session.
+-- Pass countdown = 0 to skip straight to polling (used when reconnecting).
+function App:startAutoConnect(countdown: number)
+	local target = self.autoConnectTarget
+	if target == nil or self.serveSession ~= nil or not RunService:IsEdit() then
+		return
+	end
+
+	self:stopAutoConnect()
+	self.autoConnectToastHidden = false
+	self.setHost(if target.host == Config.defaultHost then "" else target.host)
+	self.setPort(target.port)
+
+	-- Identifies this attempt, so a stopped attempt never acts after resuming
+	local token = {}
+	self.autoConnectToken = token
+
+	task.spawn(function()
+		self.autoConnectThread = coroutine.running()
+
+		for remaining = countdown, 1, -1 do
+			local host, port = self:getHostAndPort()
+			self:setAutoConnectStatus(`Auto-connecting to {host}:{port} in {remaining}s...`)
+			task.wait(1)
+		end
+
+		while self.autoConnectToken == token do
+			local host, port = self:getHostAndPort()
+			local found, serverInfo = self:findActiveServer():await()
+			if self.autoConnectToken ~= token then
+				return
+			end
+
+			if found then
+				local expectedName = workspace:GetAttribute(AUTO_CONNECT_PROJECT_ATTRIBUTE)
+				if expectedName == nil or serverInfo.projectName == expectedName then
+					self:stopAutoConnect()
+					self:startSession()
+					return
+				end
+
+				self:setAutoConnectStatus(
+					`{host}:{port} is serving '{serverInfo.projectName}', but this place expects '{expectedName}'. Waiting...`
+				)
+			elseif isServerUnreachable(serverInfo) then
+				self:setAutoConnectStatus(`Waiting for a Rojo server on {host}:{port}...`)
+			else
+				-- Wrong protocol version, unlisted place ID, etc: retrying won't fix it
+				self.autoConnectTarget = nil
+				self:stopAutoConnect()
+				self:showError(`Auto-connect stopped: {tostring(serverInfo)}`)
+				return
+			end
+
+			task.wait(AUTO_CONNECT_POLL_INTERVAL)
+		end
+	end)
+end
+
+-- Stops a pending auto-connect but leaves it enabled, so a later drop still reconnects
+function App:stopAutoConnect()
+	local thread = self.autoConnectThread
+	self.autoConnectThread = nil
+	self.autoConnectToken = nil
+	if thread ~= nil and thread ~= coroutine.running() and coroutine.status(thread) == "suspended" then
+		task.cancel(thread)
+	end
+
+	self:clearAutoConnectStatus()
+end
+
+-- Turns auto-connect off for the rest of this Studio session (until a manual connect)
+function App:cancelAutoConnect()
+	self.autoConnectTarget = nil
+	self.autoConnectCancelled = true
+	self:stopAutoConnect()
+end
+
+function App:onAutoConnectCancelClicked()
+	self:cancelAutoConnect()
+	self:setState({
+		toolbarIcon = Assets.Images.PluginButton,
+	})
+	self:addNotification({
+		text = "Auto-connect cancelled for this session. Click Connect to sync manually.",
+		timeout = 5,
+	})
+end
+
+function App:setAutoConnectStatus(text: string)
+	self:setState({
+		autoConnectText = text,
+	})
+
+	if self.autoConnectNotifId ~= nil and self.state.notifications[self.autoConnectNotifId] then
+		self:setNotificationText(self.autoConnectNotifId, text)
+		return
+	end
+
+	if self.autoConnectToastHidden then
+		return
+	end
+
+	local id
+	local dismiss = self:addNotification({
+		text = text,
+		timeout = 86400,
+		onClose = function()
+			if self.autoConnectNotifId == id then
+				self.autoConnectNotifId = nil
+			end
+		end,
+		actions = {
+			ConnectNow = {
+				text = "Connect now",
+				style = "Solid",
+				layoutOrder = 1,
+				onClick = function()
+					self:startAutoConnect(0)
+				end,
+			},
+			Hide = {
+				text = "Hide",
+				style = "Bordered",
+				layoutOrder = 2,
+				onClick = function()
+					-- Keep trying in the background; the Rojo panel still shows the status
+					self.autoConnectToastHidden = true
+				end,
+			},
+			Cancel = {
+				text = "Cancel",
+				style = "Bordered",
+				layoutOrder = 3,
+				onClick = function()
+					self:onAutoConnectCancelClicked()
+				end,
+			},
+		},
+	})
+	if dismiss == nil then
+		-- Notifications are turned off in settings
+		return
+	end
+
+	id = self.notifId
+	self.autoConnectNotifId = id
+end
+
+function App:clearAutoConnectStatus()
+	if self.autoConnectNotifId ~= nil then
+		self:closeNotification(self.autoConnectNotifId)
+		self.autoConnectNotifId = nil
+	end
+
+	if self.state.autoConnectText ~= nil then
+		self:setState({
+			autoConnectText = Roact.None,
+		})
+	end
+end
+
+function App:showError(message: string)
+	Log.warn(message)
+	self:setState({
+		appStatus = AppStatus.Error,
+		errorMessage = message,
+		toolbarIcon = Assets.Images.PluginButtonWarning,
+	})
+	self:addNotification({
+		text = message,
+		timeout = 10,
+	})
+end
+
 function App:checkSyncReminder()
 	local syncReminderMode = Settings:get("syncReminderMode")
 	if syncReminderMode == "None" then
@@ -440,6 +685,11 @@ function App:checkSyncReminder()
 
 	if self.serveSession ~= nil or not self:isSyncLockAvailable() then
 		-- Already syncing or cannot sync, no reason to remind
+		return
+	end
+
+	if self.autoConnectTarget ~= nil then
+		-- Auto-connect is already handling it
 		return
 	end
 
@@ -670,12 +920,16 @@ function App:startSession()
 		end)
 	end)
 
+	local reachedConnected = false
+
 	serveSession:onStatusChanged(function(status, details)
 		if status == ServeSession.Status.Connecting then
 			if self.dismissSyncReminder then
 				self.dismissSyncReminder()
 				self.dismissSyncReminder = nil
 			end
+			-- Covers both auto-connect finding the server and a manual Connect click
+			self:stopAutoConnect()
 
 			self:setState({
 				appStatus = AppStatus.Connecting,
@@ -688,6 +942,15 @@ function App:startSession()
 			self.knownProjects[details] = true
 			self:setPriorSyncInfo(host, port, details)
 			self:setRunningConnectionInfo(baseUrl)
+
+			-- Any successful edit-mode connection (including a manual one after
+			-- cancelling) reconnects to the same server if it drops
+			reachedConnected = true
+			if RunService:IsEdit() then
+				self.autoConnectTarget = { host = host, port = port }
+				self.autoConnectCancelled = false
+				self.autoConnectFailedSyncs = 0
+			end
 
 			local address = ("%s:%s"):format(host, port)
 			self:setState({
@@ -711,6 +974,32 @@ function App:startSession()
 				},
 			})
 
+			if details ~= nil and self.autoConnectTarget ~= nil then
+				if tostring(details) == ABORTED_MESSAGE then
+					-- Aborting the confirmation means "don't sync this place right now"
+					self:cancelAutoConnect()
+				else
+					if reachedConnected then
+						self.autoConnectFailedSyncs = 0
+					else
+						self.autoConnectFailedSyncs += 1
+					end
+
+					if self.autoConnectFailedSyncs < AUTO_CONNECT_MAX_FAILED_SYNCS then
+						Log.warn("Disconnected from an error, reconnecting: {}", details)
+						self:setState({
+							appStatus = AppStatus.NotConnected,
+							toolbarIcon = Assets.Images.PluginButtonWarning,
+						})
+						self:startAutoConnect(0)
+						return
+					end
+
+					Log.warn("Auto-connect gave up after {} failed syncs in a row", self.autoConnectFailedSyncs)
+					self.autoConnectTarget = nil
+				end
+			end
+
 			-- Details being present indicates that this
 			-- disconnection was from an error.
 			if details ~= nil then
@@ -731,7 +1020,9 @@ function App:startSession()
 					toolbarIcon = Assets.Images.PluginButton,
 				})
 				self:addNotification({
-					text = "Disconnected from session.",
+					text = if self.autoConnectCancelled and getAttributePort() ~= nil
+						then "Disconnected from session.\nAuto-connect is off until you connect again."
+						else "Disconnected from session.",
 					timeout = 10,
 				})
 			end
@@ -836,6 +1127,9 @@ function App:endSession()
 
 	Log.trace("Disconnecting session")
 
+	-- A manual disconnect also means "stop auto-connecting" for this session
+	self:cancelAutoConnect()
+
 	self.serveSession:stop()
 	self.serveSession = nil
 	self:setState({
@@ -906,6 +1200,11 @@ function App:render()
 
 						onConnect = function()
 							self:startSession()
+						end,
+
+						autoConnectText = self.state.autoConnectText,
+						onCancelAutoConnect = function()
+							self:onAutoConnectCancelClicked()
 						end,
 
 						onNavigateSettings = function()

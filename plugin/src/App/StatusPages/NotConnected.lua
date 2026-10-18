@@ -88,6 +88,43 @@ local function AddressEntry(props)
 	end)
 end
 
+-- "Auto-connecting in 3s..." / "Waiting for a Rojo server..." with a Cancel button
+local function AutoConnectStatus(props)
+	return Theme.with(function(theme)
+		return e("Frame", {
+			Size = UDim2.new(1, 0, 0, 34),
+			LayoutOrder = props.layoutOrder,
+			BackgroundTransparency = 1,
+		}, {
+			Status = e("TextLabel", {
+				Text = props.text,
+				FontFace = theme.Font.Main,
+				TextSize = theme.TextSize.Small,
+				TextColor3 = theme.SubTextColor,
+				TextTransparency = props.transparency,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextWrapped = true,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				Size = UDim2.new(1, -90, 1, 0),
+				BackgroundTransparency = 1,
+			}),
+
+			Cancel = e(TextButton, {
+				text = "Cancel",
+				style = "Bordered",
+				transparency = props.transparency,
+				position = UDim2.new(1, 0, 0, 0),
+				anchorPoint = Vector2.new(1, 0),
+				onClick = props.onCancel,
+			}, {
+				Tip = e(Tooltip.Trigger, {
+					text = "Stop auto-connecting for this Studio session",
+				}),
+			}),
+		})
+	end)
+end
+
 local NotConnectedPage = Roact.Component:extend("NotConnectedPage")
 
 function NotConnectedPage:render()
@@ -143,6 +180,15 @@ function NotConnectedPage:render()
 				Padding = UDim.new(0, 10),
 			}),
 		}),
+
+		AutoConnect = if self.props.autoConnectText
+			then e(AutoConnectStatus, {
+				text = self.props.autoConnectText,
+				onCancel = self.props.onCancelAutoConnect,
+				transparency = self.props.transparency,
+				layoutOrder = 4,
+			})
+			else nil,
 
 		Layout = e("UIListLayout", {
 			HorizontalAlignment = Enum.HorizontalAlignment.Center,
