@@ -524,7 +524,8 @@ function App:startAutoConnect(countdown: number)
 
 		for remaining = countdown, 1, -1 do
 			local host, port = self:getHostAndPort()
-			self:setAutoConnectStatus(`Auto-connecting to {host}:{port} in {remaining}s...`)
+			-- Own line for the countdown so the toast doesn't rewrap as the digit changes
+			self:setAutoConnectStatus(`Auto-connecting to {host}:{port}\nin {remaining}s...`)
 			task.wait(1)
 		end
 
@@ -547,7 +548,7 @@ function App:startAutoConnect(countdown: number)
 					`{host}:{port} is serving '{serverInfo.projectName}', but this place expects '{expectedName}'. Waiting...`
 				)
 			elseif isServerUnreachable(serverInfo) then
-				self:setAutoConnectStatus(`Waiting for a Rojo server on {host}:{port}...`)
+				self:setAutoConnectStatus(`Waiting for a Rojo server\non {host}:{port}...`)
 			else
 				-- Wrong protocol version, unlisted place ID, etc: retrying won't fix it
 				self.autoConnectTarget = nil
@@ -961,6 +962,27 @@ function App:startSession()
 			})
 			self:addNotification({
 				text = string.format("Connected to session '%s' at %s.", details, address),
+				timeout = 8,
+				actions = {
+					Disconnect = {
+						text = "Disconnect",
+						style = "Bordered",
+						layoutOrder = 1,
+						onClick = function()
+							self:endSession()
+						end,
+					},
+					OpenPanel = {
+						text = "Open panel",
+						style = "Bordered",
+						layoutOrder = 2,
+						onClick = function()
+							self:setState({
+								guiEnabled = true,
+							})
+						end,
+					},
+				},
 			})
 		elseif status == ServeSession.Status.Disconnected then
 			self.serveSession = nil
@@ -1166,7 +1188,8 @@ function App:render()
 		e(Theme.StudioProvider, nil, {
 			tooltip = e(Tooltip.Provider, nil, {
 				gui = e(StudioPluginGui, {
-					id = pluginName,
+					-- Stable id (not versioned) so Studio keeps the panel's dock state across builds
+					id = "Rojo",
 					title = pluginName,
 					active = self.state.guiEnabled,
 					isEphemeral = false,
@@ -1335,8 +1358,24 @@ function App:render()
 				end,
 			}),
 
+			togglePanelAction = e(StudioPluginAction, {
+				name = "RojoTogglePanel",
+				title = "Rojo: Show/Hide panel",
+				description = "Shows or hides the Rojo panel",
+				icon = Assets.Images.PluginButton,
+				bindable = true,
+				onTriggered = function()
+					self:setState(function(state)
+						return {
+							guiEnabled = not state.guiEnabled,
+						}
+					end)
+				end,
+			}),
+
+			-- Stable name (not versioned) so Studio treats rebuilds as the same toolbar
 			toolbar = e(StudioToolbar, {
-				name = pluginName,
+				name = "Rojo",
 			}, {
 				button = e(StudioToggleButton, {
 					name = "Rojo",
