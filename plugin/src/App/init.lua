@@ -183,8 +183,10 @@ function App:init()
 		end)
 
 		if attributePort then
+			-- Started from didMount: the countdown toast measures its text (which
+			-- yields), and doing that mid-mount delays creating the toolbar button
 			self.autoConnectTarget = { host = Config.defaultHost, port = attributePort }
-			self:startAutoConnect(AUTO_CONNECT_COUNTDOWN)
+			self.startAutoConnectOnMount = true
 		else
 			self:tryAutoReconnect():andThen(function(didReconnect)
 				if not didReconnect then
@@ -222,6 +224,15 @@ function App:init()
 			self:clearRunningConnectionInfo()
 		end
 	end)
+end
+
+function App:didMount()
+	if self.startAutoConnectOnMount then
+		self.startAutoConnectOnMount = nil
+		task.defer(function()
+			self:startAutoConnect(AUTO_CONNECT_COUNTDOWN)
+		end)
+	end
 end
 
 function App:willUnmount()
